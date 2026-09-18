@@ -5,11 +5,11 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import consumers, db, forks, repo, reversals, seals, transfers
+from . import consumers, db, forks, repo, reversals, seals, snapshots, transfers
 
 
 @asynccontextmanager
@@ -252,6 +252,26 @@ class SealOut(BaseModel):
     sha256: str = Field(..., description="SHA-256 of the canonical newline-joined JSON events")
 
 
+class SnapshotEventOut(BaseModel):
+    event_id: str
+    sequence: int
+    delta: int
+
+
+class EventPageOut(BaseModel):
+    stream_id: str
+    snapshot_next_sequence: int = Field(
+        ..., description="Snapshot upper bound (exclusive) pinned by the first request"
+    )
+    balance: int = Field(
+        ..., description="Balance at the snapshot version (applied deltas below the bound)"
+    )
+    events: list[SnapshotEventOut]
+    next_cursor: str | None = Field(
+        ..., description="Opaque cursor for the next page; null on the last page"
+    )
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -303,6 +323,38 @@ def get_stream(stream_id: str) -> StreamStateOut:
             detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
         )
     return StreamStateOut(**state.as_dict())
+
+
+@app.get(
+    "/streams/{stream_id}/events",
+    response_model=EventPageOut,
+    tags=["events"],
+    summary="Export the applied event history as a stable, paginated snapshot",
+)
+def list_stream_events(
+    stream_id: str,
+    limit: int = Query(
+        100, ge=1, le=1000, description="Maximum number of events per page"
+    ),
+    cursor: str | None = Query(
+        None,
+        description="Opaque continuation cursor (the next_cursor of the previous page); "
+        "omit it to pin a fresh snapshot",
+    ),
+) -> EventPageOut:
+    try:
+        page = snapshots.get_events_page(stream_id, limit, cursor)
+    except snapshots.CursorError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    if page is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+    return EventPageOut(**page.as_dict())
 
 
 @app.post(

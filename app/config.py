@@ -25,3 +25,14 @@ def lease_duration_seconds() -> int:
     except ValueError:
         return 30
     return value if value > 0 else 30
+
+
+# Fallback HMAC key for snapshot export cursors, used only when
+# SNAPSHOT_CURSOR_SECRET is not set. Fine for local development; real
+# deployments must set the env var (docker-compose.yml ships a usable default).
+DEFAULT_SNAPSHOT_CURSOR_SECRET = "dev-snapshot-cursor-secret"
+
+
+def snapshot_cursor_secret() -> str:
+    """HMAC-SHA256 key signing snapshot export cursors (env SNAPSHOT_CURSOR_SECRET)."""
+    return os.environ.get("SNAPSHOT_CURSOR_SECRET", DEFAULT_SNAPSHOT_CURSOR_SECRET)

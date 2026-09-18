@@ -1421,3 +1421,323 @@ def test_concurrent_seal_retries_commit_exactly_once(client):
     assert sorted(statuses) == [200] * 19 + [201]
     # The stream stayed sealed and never accepted another event.
     assert client.get("/streams/z-conc").json()["next_sequence"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# Event history snapshot export
+# --------------------------------------------------------------------------- #
+
+
+def _page(client, stream_id, limit=None, cursor=None):
+    params = {}
+    if limit is not None:
+        params["limit"] = limit
+    if cursor is not None:
+        params["cursor"] = cursor
+    return client.get(f"/streams/{stream_id}/events", params=params)
+
+
+def _walk_pages(client, stream_id, limit):
+    """Follow next_cursor to the end; return (events, pages, last_body)."""
+    events, cursor, pages, body = [], None, 0, None
+    while True:
+        r = _page(client, stream_id, limit=limit, cursor=cursor)
+        assert r.status_code == 200
+        body = r.json()
+        events.extend(body["events"])
+        pages += 1
+        cursor = body["next_cursor"]
+        if cursor is None:
+            return events, pages, body
+
+
+def _sign_payload(payload_bytes):
+    import base64
+    import hashlib
+    import hmac
+
+    from app import config
+
+    body = base64.urlsafe_b64encode(payload_bytes).decode("ascii")
+    sig = base64.urlsafe_b64encode(
+        hmac.new(
+            config.snapshot_cursor_secret().encode("utf-8"),
+            payload_bytes,
+            hashlib.sha256,
+        ).digest()
+    ).decode("ascii")
+    return f"{body}.{sig}"
+
+
+def _craft_cursor(payload_dict):
+    import json
+
+    return _sign_payload(
+        json.dumps(
+            payload_dict, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    )
+
+
+def test_snapshot_export_paginates_in_sequence_order(client):
+    _seed_deltas(client, "x-basic", (100, -30, 20, 10, 5))  # balance 105, next 5
+
+    r = _page(client, "x-basic", limit=2)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["stream_id"] == "x-basic"
+    assert body["snapshot_next_sequence"] == 5
+    assert body["balance"] == 105
+    assert [e["sequence"] for e in body["events"]] == [0, 1]
+    assert body["next_cursor"]
+
+    events, pages, last = _walk_pages(client, "x-basic", 2)
+    assert pages == 3
+    assert [e["sequence"] for e in events] == [0, 1, 2, 3, 4]
+    assert [e["delta"] for e in events] == [100, -30, 20, 10, 5]
+    assert [e["event_id"] for e in events] == [f"x-basic-e{i}" for i in range(5)]
+    # The last page terminates the export.
+    assert last["next_cursor"] is None
+    # Every page reports the same pinned snapshot bound and version balance.
+    assert last["snapshot_next_sequence"] == 5
+    assert last["balance"] == 105
+
+
+def test_snapshot_export_exact_page_boundary_ends_cleanly(client):
+    _seed_deltas(client, "x-even", (1, 2, 3, 4))  # exactly two pages of 2
+
+    events, pages, last = _walk_pages(client, "x-even", 2)
+    assert pages == 2
+    assert [e["sequence"] for e in events] == [0, 1, 2, 3]
+    assert last["events"][1]["sequence"] == 3
+    assert last["next_cursor"] is None
+
+
+def test_snapshot_is_stable_under_concurrent_appends(client):
+    _seed_deltas(client, "x-conc", (10, 20, 30, 40, 50))  # balance 150, next 5
+
+    first = _page(client, "x-conc", limit=2).json()
+    assert first["snapshot_next_sequence"] == 5
+    cursor = first["next_cursor"]
+
+    # Concurrent appends land after the snapshot was pinned.
+    _post(client, "x-conc", "x-conc-e5", 5, 60)
+    _post(client, "x-conc", "x-conc-e6", 6, 70)
+    assert client.get("/streams/x-conc").json()["next_sequence"] == 7
+
+    # The ongoing export keeps reading the pinned snapshot: no new events,
+    # no gaps, no duplicates, and the balance stays at the snapshot version.
+    events, pages, last = [first["events"]], 1, None
+    while cursor is not None:
+        body = _page(client, "x-conc", limit=2, cursor=cursor).json()
+        events.append(body["events"])
+        cursor = body["next_cursor"]
+        pages += 1
+        last = body
+    flat = [e for page in events for e in page]
+    assert pages == 3
+    assert [e["sequence"] for e in flat] == [0, 1, 2, 3, 4]
+    assert last["snapshot_next_sequence"] == 5
+    assert last["balance"] == 150
+
+    # A fresh export pins a new snapshot that includes the appended events.
+    fresh = _page(client, "x-conc", limit=100).json()
+    assert fresh["snapshot_next_sequence"] == 7
+    assert fresh["balance"] == 280
+    assert [e["sequence"] for e in fresh["events"]] == list(range(7))
+
+
+def test_snapshot_export_reuses_old_cursor_for_same_page(client):
+    _seed_deltas(client, "x-replay", (1, 2, 3, 4))
+
+    first = _page(client, "x-replay", limit=2).json()
+    _post(client, "x-replay", "x-replay-e4", 4, 5)  # appended after the snapshot
+
+    page2a = _page(client, "x-replay", limit=2, cursor=first["next_cursor"]).json()
+    page2b = _page(client, "x-replay", limit=2, cursor=first["next_cursor"]).json()
+    assert page2a == page2b
+    assert [e["sequence"] for e in page2a["events"]] == [2, 3]
+    assert page2a["next_cursor"] is None
+
+
+def test_snapshot_export_ignores_pending_events(client):
+    _post(client, "x-gap", "x-gap-e0", 0, 100)
+    _post(client, "x-gap", "x-gap-e2", 2, 300)  # buffered behind the gap at 1
+
+    body = _page(client, "x-gap", limit=10).json()
+    assert body["snapshot_next_sequence"] == 1
+    assert body["balance"] == 100
+    assert [e["sequence"] for e in body["events"]] == [0]
+    assert body["next_cursor"] is None
+
+    # Close the gap after the export: a new snapshot observes the catch-up.
+    _post(client, "x-gap", "x-gap-e1", 1, 200)
+    fresh = _page(client, "x-gap", limit=10).json()
+    assert fresh["snapshot_next_sequence"] == 3
+    assert fresh["balance"] == 600
+    assert [e["sequence"] for e in fresh["events"]] == [0, 1, 2]
+
+
+def test_snapshot_export_empty_stream(client):
+    # A stream created by an empty fork has no events at all.
+    _seed_deltas(client, "x-src", (1,))
+    r = client.post(
+        "/streams/x-src/forks",
+        json={"fork_id": "f-empty", "target_stream_id": "x-empty", "through_sequence": 0},
+    )
+    assert r.status_code == 201
+
+    body = _page(client, "x-empty", limit=10).json()
+    assert body["snapshot_next_sequence"] == 0
+    assert body["balance"] == 0
+    assert body["events"] == []
+    assert body["next_cursor"] is None
+
+
+def test_snapshot_export_default_limit_is_100(client):
+    _seed_applied_events(client, "x-default", 105)
+
+    body = _page(client, "x-default").json()
+    assert len(body["events"]) == 100
+    assert body["snapshot_next_sequence"] == 105
+    assert body["next_cursor"] is not None
+
+    rest = _page(client, "x-default", cursor=body["next_cursor"]).json()
+    assert [e["sequence"] for e in rest["events"]] == [100, 101, 102, 103, 104]
+    assert rest["next_cursor"] is None
+
+
+def test_snapshot_export_unknown_stream_returns_404(client):
+    r = _page(client, "x-ghost")
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+
+    # A valid cursor does not resurrect a missing stream either.
+    _seed_deltas(client, "x-alive", (1, 2, 3))
+    cursor = _page(client, "x-alive", limit=1).json()["next_cursor"]
+    r = _page(client, "x-ghost", cursor=cursor)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+
+
+def test_snapshot_export_limit_validation(client):
+    _seed_deltas(client, "x-limit", (1,))
+    assert _page(client, "x-limit", limit=0).status_code == 422
+    assert _page(client, "x-limit", limit=-3).status_code == 422
+    assert _page(client, "x-limit", limit=1001).status_code == 422
+    assert client.get("/streams/x-limit/events?limit=abc").status_code == 422
+
+
+def test_snapshot_cursor_is_signed_canonical_json(client):
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    from app import config
+
+    _seed_deltas(client, "x-cursor", (1, 2, 3))
+    cursor = _page(client, "x-cursor", limit=1).json()["next_cursor"]
+
+    body_b64, sig_b64 = cursor.split(".")
+    payload = base64.urlsafe_b64decode(body_b64)
+    # Canonical JSON: sorted keys, compact separators, exactly the three fields.
+    assert payload == (
+        b'{"next_sequence":1,"snapshot_next_sequence":3,"stream_id":"x-cursor"}'
+    )
+    expected_sig = hmac.new(
+        config.snapshot_cursor_secret().encode("utf-8"), payload, hashlib.sha256
+    ).digest()
+    assert base64.urlsafe_b64decode(sig_b64) == expected_sig
+    assert json.loads(payload) == {
+        "stream_id": "x-cursor",
+        "snapshot_next_sequence": 3,
+        "next_sequence": 1,
+    }
+
+
+def test_snapshot_cursor_tampering_returns_400(client):
+    _seed_deltas(client, "x-tamper", (1, 2, 3))
+    cursor = _page(client, "x-tamper", limit=1).json()["next_cursor"]
+    body_b64, sig_b64 = cursor.split(".")
+
+    # Flip one payload character: the signature no longer matches.
+    forged = ("A" if body_b64[0] != "A" else "B") + body_b64[1:] + "." + sig_b64
+    r = _page(client, "x-tamper", cursor=forged)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "invalid_cursor"
+
+    # Flip one signature character.
+    forged_sig = body_b64 + "." + ("A" if sig_b64[0] != "A" else "B") + sig_b64[1:]
+    assert _page(client, "x-tamper", cursor=forged_sig).status_code == 400
+
+    # Structurally invalid cursors.
+    assert _page(client, "x-tamper", cursor="not-a-cursor").status_code == 400
+    assert _page(client, "x-tamper", cursor="!!!.@@@").status_code == 400
+    assert _page(client, "x-tamper", cursor="").status_code == 400
+    assert _page(client, "x-tamper", cursor=cursor + ".extra").status_code == 400
+
+
+def test_snapshot_cursor_cross_stream_returns_400(client):
+    _seed_deltas(client, "x-one", (1, 2, 3))
+    _seed_deltas(client, "x-two", (4, 5, 6))
+    cursor = _page(client, "x-one", limit=1).json()["next_cursor"]
+
+    r = _page(client, "x-two", cursor=cursor)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "cursor_stream_mismatch"
+
+
+def test_snapshot_cursor_invalid_fields_return_400(client):
+    _seed_deltas(client, "x-fields", (1, 2, 3))
+
+    bad_payloads = [
+        {"stream_id": "x-fields"},  # missing fields
+        {  # extra field
+            "stream_id": "x-fields",
+            "snapshot_next_sequence": 3,
+            "next_sequence": 1,
+            "balance": 6,
+        },
+        {"stream_id": "x-fields", "snapshot_next_sequence": 3, "next_sequence": 4},  # past bound
+        {"stream_id": "x-fields", "snapshot_next_sequence": -1, "next_sequence": 0},
+        {"stream_id": "x-fields", "snapshot_next_sequence": 3, "next_sequence": -1},
+        {"stream_id": "x-fields", "snapshot_next_sequence": 3, "next_sequence": True},
+        {"stream_id": "x-fields", "snapshot_next_sequence": "3", "next_sequence": 1},
+        {"stream_id": "", "snapshot_next_sequence": 3, "next_sequence": 1},
+        {"stream_id": 7, "snapshot_next_sequence": 3, "next_sequence": 1},
+    ]
+    for payload in bad_payloads:
+        r = _page(client, "x-fields", cursor=_craft_cursor(payload))
+        assert r.status_code == 400, payload
+        assert r.json()["detail"]["code"] == "invalid_cursor", payload
+
+    # Validly signed but not a JSON object at all.
+    assert _page(client, "x-fields", cursor=_sign_payload(b"[1,2,3]")).status_code == 400
+    assert _page(client, "x-fields", cursor=_sign_payload(b"not json")).status_code == 400
+
+
+def test_snapshot_cursor_secret_change_invalidates_old_cursors(client, monkeypatch):
+    _seed_deltas(client, "x-secret", (1, 2, 3))
+    cursor = _page(client, "x-secret", limit=1).json()["next_cursor"]
+
+    monkeypatch.setenv("SNAPSHOT_CURSOR_SECRET", "rotated-secret")
+    r = _page(client, "x-secret", cursor=cursor)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "invalid_cursor"
+
+    # New cursors signed with the rotated secret work again.
+    assert _page(client, "x-secret", limit=1).status_code == 200
+
+
+def test_snapshot_export_unicode_stream_id_round_trip(client):
+    _seed_deltas(client, "流-快照", (7, 8, 9))
+
+    first = _page(client, "流-快照", limit=2).json()
+    assert first["snapshot_next_sequence"] == 3
+    assert [e["sequence"] for e in first["events"]] == [0, 1]
+
+    last = _page(client, "流-快照", limit=2, cursor=first["next_cursor"]).json()
+    assert [e["sequence"] for e in last["events"]] == [2]
+    assert last["balance"] == 24
+    assert last["next_cursor"] is None

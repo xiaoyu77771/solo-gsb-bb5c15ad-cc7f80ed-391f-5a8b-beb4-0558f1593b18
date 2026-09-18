@@ -193,3 +193,23 @@ def read_connection() -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def read_transaction() -> Iterator[sqlite3.Connection]:
+    """Open a connection and hold a read transaction until commit/rollback.
+
+    In WAL mode a read transaction observes one consistent snapshot of the
+    database for its whole lifetime and never blocks concurrent writers.
+    """
+    conn = _connect()
+    try:
+        _apply_pragmas(conn)
+        conn.execute("BEGIN")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()

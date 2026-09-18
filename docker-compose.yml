@@ -8,6 +8,8 @@ services:
     environment:
       APP_PORT: "8000"
       DATABASE_PATH: /data/events.db
+      # HMAC key for snapshot export cursors; usable default, override in production
+      SNAPSHOT_CURSOR_SECRET: ${SNAPSHOT_CURSOR_SECRET:-dev-snapshot-cursor-secret}
     volumes:
       - events-data:/data
     restart: unless-stopped

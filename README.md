@@ -48,6 +48,14 @@
   重放仍返回原结果；封存流仍可查询、消费（claim/ack）并作为 fork 源，fork 出来的
   新流不受影响、可继续追加。相同请求重试返回原封存结果（`200`），参数冲突返回
   `409`，并发重试只封存一次。
+- **事件历史快照导出（snapshot export）**：`GET /streams/{stream_id}/events?limit=...&cursor=...`
+  首请求在**一次读事务**中固定当前 `next_sequence` 作为快照上界
+  `snapshot_next_sequence`，之后按 sequence 升序分页返回 `[0, snapshot_next_sequence)`
+  的已应用事件与该版本余额；后续请求凭 `next_cursor` 继续**同一个快照**——并发追加的
+  新事件不会混入、不漏项、不重复，末页 `next_cursor=null`。游标为
+  `base64url(规范JSON).base64url(HMAC-SHA256)`，绑定 `stream_id`、快照上界与下一序号；
+  签名损坏、跨流使用或字段非法返回 `400`，流不存在返回 `404`。签名密钥从环境变量
+  `SNAPSHOT_CURSOR_SECRET` 读取（Compose 已提供可用默认值）。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -414,6 +422,61 @@ Content-Type: application/json
 }
 ```
 
+### 9. 事件历史快照导出（snapshot export）
+
+```
+GET /streams/{stream_id}/events?limit=...&cursor=...
+```
+
+查询参数：
+
+| 参数     | 类型   | 约束                     | 说明                                       |
+| -------- | ------ | ------------------------ | ------------------------------------------ |
+| `limit`  | int    | `1 <= limit <= 1000`，缺省 `100` | 每页最多返回多少条事件               |
+| `cursor` | string | 可选                     | 上一页返回的 `next_cursor`；缺省表示开启新快照 |
+
+**首请求（不带 `cursor`）**在**一次读事务**中固定流当前的 `next_sequence` 作为快照
+上界 `snapshot_next_sequence`，并返回第一页；**后续请求**携带上一页的 `next_cursor`，
+继续读取**同一个快照**。每一页返回：
+
+```json
+{
+  "stream_id": "acct-1",
+  "snapshot_next_sequence": 5,
+  "balance": 150,
+  "events": [
+    {"event_id": "e0", "sequence": 0, "delta": 10},
+    {"event_id": "e1", "sequence": 1, "delta": 20}
+  ],
+  "next_cursor": "eyJuZXh0X3NlcXVlbmNlIjoyLCJzbmFwc2hvdF9uZXh0X3NlcXVlbmNlIjo1LCJzdHJlYW1faWQiOiJhY2N0LTEifQ==.MEJ7rPpRz_q6G_yzlQefOS8dVoXtpdTEcdXuiTPD1O8="
+}
+```
+
+- `snapshot_next_sequence`：首请求固定的快照上界（独占），整次导出各页保持一致；
+- `balance`：**快照版本**的余额，即 `[0, snapshot_next_sequence)` 已应用事件的
+  `delta` 之和——导出期间流继续追加事件也不会改变它；
+- `events`：序号位于 `[起点, snapshot_next_sequence)` 的**已应用**事件，按
+  `sequence` 升序，至多 `limit` 条；因缺号暂存（pending）的事件不会被导出；
+- `next_cursor`：下一页的游标；**末页为 `null`**，导出结束。
+
+快照一致性：已应用事件一旦进入 `[0, snapshot_next_sequence)` 就不再变化，因此凭
+游标翻页时，**并发追加的新事件不会混入**本次快照，已有事件**不漏项、不重复**；
+重复使用同一游标返回相同的一页（幂等翻页）。需要更新数据时，重新发起不带
+`cursor` 的请求即可固定一个新快照。
+
+**游标格式**：`<base64url(payload)>.<base64url(signature)>`。`payload` 是
+`{"next_sequence":M,"snapshot_next_sequence":N,"stream_id":"..."}` 的**规范
+JSON**（键序固定、紧凑分隔符无空白、UTF-8、非 ASCII 字符原样保留）；`signature`
+是以 `SNAPSHOT_CURSOR_SECRET` 为密钥对 payload 计算的 **HMAC-SHA256**。游标绑定
+`stream_id`、快照上界与下一序号三个字段。
+
+- `400 Bad Request`：
+  - `invalid_cursor`：游标结构非法、Base64 解码失败、**签名损坏/不符**、payload
+    非 JSON 对象、字段缺失/多余/类型非法（如序号越界、布尔值、负数）；
+  - `cursor_stream_mismatch`：**跨流使用**——游标是其他流签发的；
+- `404 Not Found`：`stream_not_found`——流不存在（无论是否携带游标）；
+- `422 Unprocessable Entity`：`limit` 越界或不是整数。
+
 ## 工作机制示例
 
 ```bash
@@ -746,6 +809,49 @@ curl -s -i -X POST localhost:8000/streams/ghost/seal \
 # HTTP/1.1 404
 ```
 
+## 事件历史快照导出示例（snapshot export）
+
+```bash
+# 准备 5 个已应用事件（balance=150, next_sequence=5）
+for i in 0 1 2 3 4; do
+  curl -s -o /dev/null -X POST localhost:8000/streams/acct-5/events \
+    -H 'Content-Type: application/json' \
+    -d "{\"event_id\":\"e$i\",\"sequence\":$i,\"delta\":$((i+1))0}"
+done
+
+# 首请求（不带 cursor）：固定快照上界 snapshot_next_sequence=5，返回第一页
+curl -s 'localhost:8000/streams/acct-5/events?limit=2'
+# {"stream_id":"acct-5","snapshot_next_sequence":5,"balance":150,
+#  "events":[{"event_id":"e0","sequence":0,"delta":10},
+#            {"event_id":"e1","sequence":1,"delta":20}],
+#  "next_cursor":"eyJuZXh0X3NlcXVlbmNlIjoyLCJzbmFwc2hvdF9uZXh0X3NlcXVlbmNlIjo1LCJzdHJlYW1faWQiOiJhY2N0LTUifQ==.<签名>"}
+
+# 快照固定后继续追加新事件（不影响进行中的导出）
+curl -s -o /dev/null -X POST localhost:8000/streams/acct-5/events \
+  -H 'Content-Type: application/json' -d '{"event_id":"e5","sequence":5,"delta":60}'
+
+# 携带 next_cursor 翻页：仍是同一快照（上界 5、余额 150），新事件不会混入
+curl -s -G 'localhost:8000/streams/acct-5/events' \
+  --data-urlencode 'limit=2' \
+  --data-urlencode 'cursor=eyJuZXh0X3NlcXVlbmNlIjoyLCJzbmFwc2hvdF9uZXh0X3NlcXVlbmNlIjo1LCJzdHJlYW1faWQiOiJhY2N0LTUifQ==.<签名>'
+# -> events=[e2, e3]，next_cursor 指向下页
+# 再翻一页 -> events=[e4]，next_cursor=null，导出结束（共 5 条，不漏不重）
+
+# 重新发起不带 cursor 的请求：固定新快照，包含刚追加的事件
+curl -s 'localhost:8000/streams/acct-5/events?limit=100'
+# -> snapshot_next_sequence=6, balance=210, events=[e0..e5], next_cursor=null
+
+# 篡改游标签名 / 跨流使用：400
+curl -s -i -G 'localhost:8000/streams/acct-5/events' \
+  --data-urlencode 'cursor=AAAA.<篡改的签名>'
+# HTTP/1.1 400 -> {"detail":{"code":"invalid_cursor", ...}}
+# 把 acct-5 的游标用到别的流：400 cursor_stream_mismatch
+
+# 流不存在：404
+curl -s -i 'localhost:8000/streams/ghost/events'
+# HTTP/1.1 404 -> {"detail":{"code":"stream_not_found", ...}}
+```
+
 ## 数据模型
 
 ```text
@@ -789,6 +895,9 @@ consumers(stream_id, consumer_id, cursor_seq,
   换行拼接、无末尾换行）摘要。另外 `BEFORE INSERT` 触发器
   `trg_events_sealed_insert` 在存储层兜底：任何向已封存流插入 `events` 行的尝试
   都会被数据库直接中止，与应用层的 `stream_sealed` 检查共同保证封存不可逆。
+- 快照导出**不新增任何表**：游标是无状态的签名令牌（规范 JSON + HMAC-SHA256），
+  快照上界与翻页位置全部封装在游标内；快照一致性由"已应用事件不可变"这一事实
+  保证，而非由服务端保存的快照副本保证。
 
 租约生命周期：
 
@@ -893,6 +1002,26 @@ consumers(stream_id, consumer_id, cursor_seq,
 `transfers` / `reversals` 记录后直接返回原坐标），因此封存前完成的操作仍可安全
 重试。查询、claim/ack 与 fork 不追加源流事件，行为完全不变。
 
+快照导出的读路径：
+
+1. 首请求（无 `cursor`）在**一次读事务**（WAL 快照读，不阻塞写入）内读取流的
+   当前 `next_sequence` 作为 `snapshot_next_sequence`，并在同一事务内取回第一页
+   事件——上界与首页数据天然一致；
+2. 每一页查询都是 `applied = 1 AND sequence >= 起点 AND sequence <
+   snapshot_next_sequence ORDER BY sequence ASC LIMIT limit`：已应用事件不可变、
+   序号不复用，所以并发追加（序号只会落在 `[snapshot_next_sequence, ...)`）永远
+   不会进入快照范围，翻页不重不漏；
+3. 每页的 `balance` 按 `SUM(delta) WHERE sequence < snapshot_next_sequence`
+   现算——该区间的事件集合冻结不变，因此每页都精确等于快照版本的余额；
+4. 页未满快照末尾时签发下一游标：把 `{stream_id, snapshot_next_sequence,
+   next_sequence}` 编码为规范 JSON（`sort_keys`、紧凑分隔符、UTF-8、非 ASCII
+   原样），以 `SNAPSHOT_CURSOR_SECRET` 为密钥计算 HMAC-SHA256，两段分别做
+   URL-safe Base64 后以 `.` 拼接；到达上界时 `next_cursor = null`；
+5. 携带游标的请求先校验流存在（否则 `404`），再依次校验游标结构、Base64、
+   HMAC 签名（`hmac.compare_digest` 常量时间比较）、payload 字段（恰好三个字段、
+   类型与取值合法、`next_sequence <= snapshot_next_sequence`）与流绑定——任一
+   失败返回 `400`，签名密钥轮换后旧游标自然失效（`400 invalid_cursor`）。
+
 ## 配置
 
 | 环境变量                | 默认值                | 说明                          |
@@ -900,6 +1029,7 @@ consumers(stream_id, consumer_id, cursor_seq,
 | `APP_PORT`              | `8000`                | 服务监听端口                  |
 | `DATABASE_PATH`         | `/data/events.db`     | SQLite 文件路径               |
 | `LEASE_DURATION_SECONDS` | `30`                 | claim 租约有效时长（秒，> 0） |
+| `SNAPSHOT_CURSOR_SECRET` | `dev-snapshot-cursor-secret` | 快照导出游标的 HMAC-SHA256 签名密钥；Compose 通过 `${SNAPSHOT_CURSOR_SECRET:-dev-snapshot-cursor-secret}` 提供可用默认值，生产环境务必覆盖为随机长密钥。轮换密钥会使既有游标全部失效（`400`） |
 
 ## 运行测试
 
@@ -933,7 +1063,13 @@ claim/fork 观察、撤销转账事件、撤销的撤销，以及 20 线程并�
 新提交 `409 stream_sealed` 但旧事件幂等重放 `200`、封存流作为转账源/目标均被拒
 但封存前转账可重放、封存后新撤销被拒但封存前撤销可重放、封存流仍可查询/消费/
 ack/作为 fork 源且 fork 目标可追加、请求体 `422`，以及 20 线程并发（同一封存
-请求恰好一次 `201`，其余 `200`）。
+请求恰好一次 `201`，其余 `200`）；快照导出部分覆盖：按 sequence 升序分页、整页
+边界末页 `next_cursor=null`、快照固定后并发追加不混入/不漏项/不重复且余额保持
+快照版本、旧游标幂等重放同一页、暂存事件不导出、空流与缺省 `limit=100`、流不
+存在 `404`（含携带游标）、`limit` 非法 `422`、游标为规范 JSON + HMAC-SHA256 且
+可验签、篡改 payload/签名/结构非法 `400 invalid_cursor`、跨流使用
+`400 cursor_stream_mismatch`、合法签名但字段非法（缺字段/多字段/越界/负数/布尔/
+类型错误）`400`、密钥轮换后旧游标失效、Unicode 流名游标往返。
 
 仅用 Python 标准库验证核心归并算法（无需安装 FastAPI）：
 
@@ -943,6 +1079,7 @@ python3 verify_forks.py
 python3 verify_transfers.py
 python3 verify_reversals.py
 python3 verify_seals.py
+python3 verify_snapshots.py
 ```
 
 ## 项目结构
@@ -957,6 +1094,7 @@ python3 verify_seals.py
 │   ├── transfers.py   # 跨事件流原子转账（transfer）幂等事务
 │   ├── reversals.py   # 事件撤销（reversal）幂等事务
 │   ├── seals.py       # 不可逆封存（seal）与规范 SHA-256 摘要
+│   ├── snapshots.py   # 事件历史快照导出与 HMAC 签名游标
 │   ├── consumers.py   # 消费游标与 claim/ack 租约
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
@@ -966,6 +1104,7 @@ python3 verify_seals.py
 ├── verify_transfers.py
 ├── verify_reversals.py
 ├── verify_seals.py
+├── verify_snapshots.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
