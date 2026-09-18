@@ -25,3 +25,19 @@ def lease_duration_seconds() -> int:
     except ValueError:
         return 30
     return value if value > 0 else 30
+
+
+# Development-only default so `docker compose up` works with zero configuration.
+# Deployments must override it with SNAPSHOT_CURSOR_SECRET: rotating/changing the
+# secret invalidates every snapshot cursor signed with the previous value.
+DEFAULT_SNAPSHOT_CURSOR_SECRET = "dev-only-snapshot-cursor-secret-change-me"
+
+
+def snapshot_cursor_secret() -> bytes:
+    """Return the HMAC key for snapshot cursors as UTF-8 bytes.
+
+    Reads ``SNAPSHOT_CURSOR_SECRET``; an unset or empty value falls back to a
+    built-in development default so the service stays one-command startable.
+    """
+    secret = os.environ.get("SNAPSHOT_CURSOR_SECRET", "").strip()
+    return (secret or DEFAULT_SNAPSHOT_CURSOR_SECRET).encode("utf-8")

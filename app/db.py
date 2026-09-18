@@ -193,3 +193,25 @@ def read_connection() -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def read_transaction() -> Iterator[sqlite3.Connection]:
+    """Open a connection holding a deferred read transaction.
+
+    Under WAL every SELECT inside the transaction reads the same snapshot taken
+    at the first read, so several reads observe one consistent version even
+    while writers commit concurrently. Readers never block (or block on)
+    writers; commit/rollback only releases the snapshot.
+    """
+    conn = _connect()
+    try:
+        _apply_pragmas(conn)
+        conn.execute("BEGIN")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()

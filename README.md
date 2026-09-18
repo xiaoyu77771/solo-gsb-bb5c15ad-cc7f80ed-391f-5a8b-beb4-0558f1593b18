@@ -48,6 +48,14 @@
   重放仍返回原结果；封存流仍可查询、消费（claim/ack）并作为 fork 源，fork 出来的
   新流不受影响、可继续追加。相同请求重试返回原封存结果（`200`），参数冲突返回
   `409`，并发重试只封存一次。
+- **事件历史快照导出（snapshot）**：`GET /streams/{stream_id}/events?limit=…&cursor=…`
+  首次请求在**一次只读事务内固定当前 `next_sequence`**（快照上界
+  `snapshot_next_sequence`），只返回 `[0, snapshot_next_sequence)` 的**已应用**事件
+  与**该版本**余额，按 sequence 升序分页。后续请求必须携带上一页的 `next_cursor`
+  继续**同一快照**：游标是「规范 JSON + URL-safe Base64 + HMAC-SHA256」的不透明
+  token，绑定 `stream_id`、快照上界与下一序号，因此即使分页期间并发追加事件，也
+  绝不会混入新事件、漏项或重复。签名损坏、跨流使用或字段非法一律 `400`；末页
+  `next_cursor=null`；流不存在 `404`。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -414,6 +422,88 @@ Content-Type: application/json
 }
 ```
 
+### 9. 事件历史快照导出（snapshot）
+
+```
+GET /streams/{stream_id}/events?limit=100&cursor=<上一页的 next_cursor>
+```
+
+只读导出某条流的**已应用事件历史**，按 `sequence` 升序分页，整次遍历固定在一个
+不可变快照上。
+
+查询参数：
+
+| 参数     | 类型 | 约束               | 说明                                                                 |
+| -------- | ---- | ------------------ | -------------------------------------------------------------------- |
+| `limit`  | int  | 可选，`1..1000`，默认 `100` | 每页最多返回的事件数                                         |
+| `cursor` | string | 可选             | 上一页响应中的 `next_cursor`；**省略即开启新快照**，之后必须逐页续用 |
+
+行为：
+
+1. **首请求（无 `cursor`）**：在**一次只读事务**中读取并固定流当前的
+   `next_sequence` 作为快照上界 `snapshot_next_sequence`。该事务同时返回
+   `[0, snapshot_next_sequence)` 区间的事件与流余额，两者来自同一个读快照；因缺号
+   而暂存（`applied=0`）的事件不在其中。
+2. **后续请求（带 `cursor`）**：游标已绑定首请求的快照上界，每页只返回
+   `[next_sequence, snapshot_next_sequence)` 内的事件；页内事件按 `sequence` 升序，
+   页之间严格衔接，**不重、不漏**。
+3. **并发追加无影响**：分页进行中即使有新事件提交并追赶应用，快照上界与该版本
+   余额也保持不变，新事件只可能出现在**重新发起的新快照**（不带 `cursor`）中。
+   SQLite WAL 下只读事务不阻塞写入，导出与提交互不干扰。
+4. **结束页**：当本页最后一个事件到达快照上界（`next_sequence ==
+   snapshot_next_sequence`，含空流/空前缀的首页）时，`next_cursor` 为 `null`。
+
+响应字段：
+
+| 字段                        | 说明                                                  |
+| --------------------------- | ----------------------------------------------------- |
+| `stream_id`                 | 流 id                                                 |
+| `snapshot_next_sequence`    | 快照固定的排他上界；同一快照的每一页都相同            |
+| `balance`                   | **快照版本**上 `[0, snapshot_next_sequence)` 的余额   |
+| `from_sequence`             | 本页首个事件的 sequence                               |
+| `events[]`                  | `{event_id, sequence, delta}`，按 sequence 升序       |
+| `next_cursor`               | 下一页的不透明游标；末页为 `null`                     |
+
+游标格式（客户端应视为不透明字符串，无需自行解析）：
+
+```text
+base64url(canonical_json(payload)) + "." + base64url(HMAC-SHA256(payload, secret))
+```
+
+- `payload` 为**规范 JSON**：`json.dumps(..., ensure_ascii=False,
+  separators=(",",":"), sort_keys=True)` 的 UTF-8 字节——紧凑无空白、键排序、
+  Unicode 原样保留；恰好包含三个字段：
+  `stream_id`（string，非空）、`snapshot_next_sequence`（int，`>= 0`）、
+  `next_sequence`（int，`0 <= next_sequence <= snapshot_next_sequence`）；
+- Base64 使用 URL-safe 字母表（`-`/`_`）且**不带 `=` 填充**；
+- HMAC 密钥来自环境变量 `SNAPSHOT_CURSOR_SECRET`，使用常量时间比较验签。
+
+状态码：
+
+- `200 OK`：返回一页；
+- `400 Bad Request`：游标非法——
+  - `invalid_cursor`：格式错误、非 URL-safe Base64、载荷不是合法 JSON、字段集合
+    不是恰好三个、字段类型非法（含布尔值冒充整数）、序号为负或
+    `next_sequence > snapshot_next_sequence`；
+  - `invalid_cursor_signature`：签名与载荷不符（篡改、截断或用其他密钥签发）；
+  - `cursor_stream_mismatch`：游标绑定的 `stream_id` 与请求路径不一致（跨流复用）；
+- `404 Not Found`：`stream_not_found`——流不存在（导出不会自动建流）；
+- `422 Unprocessable Entity`：`limit` 不在 `1..1000` 或不是整数。
+
+```json
+{
+  "stream_id": "acct-1",
+  "snapshot_next_sequence": 3,
+  "balance": 350,
+  "from_sequence": 0,
+  "events": [
+    {"event_id": "e0", "sequence": 0, "delta": 100},
+    {"event_id": "e1", "sequence": 1, "delta": 200}
+  ],
+  "next_cursor": "eyJuZXh0X3NlcXVlbmNlIjoyLCJzbmFwc2hvdF9uZXh0X3NlcXVlbmNlIjozLCJzdHJlYW1faWQiOiJhY2N0LTEifQ.BN0o_59wLFvmwhqZFKfEn0BCliawBG2YjRvlCS6AKJw"
+}
+```
+
 ## 工作机制示例
 
 ```bash
@@ -746,6 +836,49 @@ curl -s -i -X POST localhost:8000/streams/ghost/seal \
 # HTTP/1.1 404
 ```
 
+## 事件历史快照导出示例（snapshot）
+
+```bash
+# 准备 3 个已应用事件（balance=350, next_sequence=3）
+curl -s -X POST localhost:8000/streams/acct-h/events \
+  -H 'Content-Type: application/json' -d '{"event_id":"e0","sequence":0,"delta":100}'
+curl -s -X POST localhost:8000/streams/acct-h/events \
+  -H 'Content-Type: application/json' -d '{"event_id":"e1","sequence":1,"delta":200}'
+curl -s -X POST localhost:8000/streams/acct-h/events \
+  -H 'Content-Type: application/json' -d '{"event_id":"e2","sequence":2,"delta":50}'
+
+# 首请求：省略 cursor，在一次只读事务内固定 snapshot_next_sequence=3
+curl -s 'localhost:8000/streams/acct-h/events?limit=2'
+# {
+#   "stream_id":"acct-h","snapshot_next_sequence":3,"balance":350,
+#   "from_sequence":0,
+#   "events":[{"event_id":"e0","sequence":0,"delta":100},
+#             {"event_id":"e1","sequence":1,"delta":200}],
+#   "next_cursor":"<opaque>"
+# }
+
+# 用 next_cursor 续页（即使此刻有并发追加，也只在快照 [0,3) 内分页）
+curl -s "localhost:8000/streams/acct-h/events?limit=2&cursor=<opaque>"
+# -> from_sequence=2, events=[e2], next_cursor=null（末页）
+
+# 末页再次使用同一游标：得到空页且 next_cursor 仍为 null
+# 分页期间并发追加的事件不会出现；不带 cursor 重新请求才会开启新快照。
+
+# 篡改 / 伪造签名 / 跨流使用游标：400
+curl -s -i 'localhost:8000/streams/acct-h/events?cursor=garbage'
+# HTTP/1.1 400 -> {"detail":{"code":"invalid_cursor", ...}}
+curl -s -i 'localhost:8000/streams/acct-h/events?cursor=<A流游标>'
+# 在 B 流路径上使用 -> HTTP/1.1 400 cursor_stream_mismatch
+
+# limit 非法：422
+curl -s -o /dev/null -w '%{http_code}\n' 'localhost:8000/streams/acct-h/events?limit=0'
+# 422
+
+# 流不存在：404
+curl -s -o /dev/null -w '%{http_code}\n' 'localhost:8000/streams/ghost/events'
+# 404
+```
+
 ## 数据模型
 
 ```text
@@ -893,6 +1026,20 @@ consumers(stream_id, consumer_id, cursor_seq,
 `transfers` / `reversals` 记录后直接返回原坐标），因此封存前完成的操作仍可安全
 重试。查询、claim/ack 与 fork 不追加源流事件，行为完全不变。
 
+快照导出是**无状态、不落库**的只读分页，快照一致性完全由游标与事务保证：
+
+1. 首请求开启一个**延迟只读事务**（WAL 下首条 SELECT 即取得读快照，不阻塞写）：
+   读取 `streams.next_sequence`/`balance` 与第一页事件属于同一个读快照，把当前
+   `next_sequence` 固定为 `snapshot_next_sequence`；
+2. 只查询序号位于 `[cursor.next_sequence, snapshot_next_sequence)` 的事件并按
+   `sequence` 升序 `LIMIT`；已应用前缀不可变，故各页不会重、漏，也读不到快照
+   上界之外并发追加的新事件；
+3. 每页的版本余额对 `[0, snapshot_next_sequence)` 的事件 `delta` 求和——该行集合
+   不可变，任意一页算出的 `balance` 都与首页从事物流读到的快照余额一致；
+4. 下一起始序号达到快照上界时 `next_cursor=null`，否则签发绑定
+   `(stream_id, snapshot_next_sequence, next_sequence)` 的 HMAC 游标；服务端不保存
+   游标，密钥轮换后旧游标验签失败（`400`），客户端重新发起无 `cursor` 请求即可。
+
 ## 配置
 
 | 环境变量                | 默认值                | 说明                          |
@@ -900,6 +1047,10 @@ consumers(stream_id, consumer_id, cursor_seq,
 | `APP_PORT`              | `8000`                | 服务监听端口                  |
 | `DATABASE_PATH`         | `/data/events.db`     | SQLite 文件路径               |
 | `LEASE_DURATION_SECONDS` | `30`                 | claim 租约有效时长（秒，> 0） |
+| `SNAPSHOT_CURSOR_SECRET` | `dev-only-snapshot-cursor-secret-change-me` | 快照分页游标的 HMAC-SHA256 密钥；默认值仅供本地开发，生产部署务必通过环境变量设置为足够长的随机值（如 `python3 -c "import secrets;print(secrets.token_urlsafe(48))"`）。更换密钥后，用旧密钥签发的游标验签失败并返回 `400`，重新发起无 `cursor` 的请求即可开启新快照。 |
+
+> 一键启动无需任何配置：`docker-compose.yml` 已内置上述开发默认值，也可通过
+> shell 环境变量覆盖（`SNAPSHOT_CURSOR_SECRET=xxx docker compose up --build`）。
 
 ## 运行测试
 
@@ -934,6 +1085,12 @@ claim/fork 观察、撤销转账事件、撤销的撤销，以及 20 线程并�
 但封存前转账可重放、封存后新撤销被拒但封存前撤销可重放、封存流仍可查询/消费/
 ack/作为 fork 源且 fork 目标可追加、请求体 `422`，以及 20 线程并发（同一封存
 请求恰好一次 `201`，其余 `200`）。
+事件历史快照部分覆盖：首请求固定版本与该版本余额、整段分页不重不漏且升序、
+分页期间并发追加（含缺号追赶）绝不混入旧快照而新快照可见、暂存事件不导出、
+空流空页、默认/越界 `limit`、流不存在 `404`、垃圾/非 Base64/错误签名/异密钥
+游标 `400`、篡改快照上界或跳页 `400`、缺字段/多余字段/负序号/越界/布尔冒充
+整数等非法载荷 `400`、跨流游标 `400 cursor_stream_mismatch`、上界游标反复取空页
+始终为 `null`、Unicode 流 id 往返，以及分页与追加并发下的前缀一致性。
 
 仅用 Python 标准库验证核心归并算法（无需安装 FastAPI）：
 
@@ -943,6 +1100,7 @@ python3 verify_forks.py
 python3 verify_transfers.py
 python3 verify_reversals.py
 python3 verify_seals.py
+python3 verify_snapshots.py
 ```
 
 ## 项目结构
@@ -957,6 +1115,7 @@ python3 verify_seals.py
 │   ├── transfers.py   # 跨事件流原子转账（transfer）幂等事务
 │   ├── reversals.py   # 事件撤销（reversal）幂等事务
 │   ├── seals.py       # 不可逆封存（seal）与规范 SHA-256 摘要
+│   ├── snapshots.py   # 事件历史快照分页与 HMAC 签名游标
 │   ├── consumers.py   # 消费游标与 claim/ack 租约
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
@@ -966,6 +1125,7 @@ python3 verify_seals.py
 ├── verify_transfers.py
 ├── verify_reversals.py
 ├── verify_seals.py
+├── verify_snapshots.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

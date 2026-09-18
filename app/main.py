@@ -5,11 +5,11 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import consumers, db, forks, repo, reversals, seals, transfers
+from . import consumers, db, forks, repo, reversals, seals, snapshots, transfers
 
 
 @asynccontextmanager
@@ -252,6 +252,33 @@ class SealOut(BaseModel):
     sha256: str = Field(..., description="SHA-256 of the canonical newline-joined JSON events")
 
 
+class SnapshotEventOut(BaseModel):
+    event_id: str
+    sequence: int
+    delta: int
+
+
+class SnapshotPageOut(BaseModel):
+    stream_id: str
+    snapshot_next_sequence: int = Field(
+        ...,
+        description=(
+            "Exclusive upper bound pinned by the first request; every page of "
+            "the snapshot covers exactly [0, snapshot_next_sequence) applied events"
+        ),
+    )
+    balance: int = Field(
+        ..., description="Balance of the applied prefix at the snapshot version"
+    )
+    from_sequence: int = Field(
+        ..., description="Sequence of the first event returned in this page"
+    )
+    events: list[SnapshotEventOut]
+    next_cursor: str | None = Field(
+        ..., description="Opaque cursor for the next page; null on the final page"
+    )
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -287,6 +314,44 @@ def submit_event(stream_id: str, event: EventIn):
     ).model_dump()
     # Idempotent replays return 200; first-time inserts return 201.
     return JSONResponse(payload, status_code=200 if replayed else 201)
+
+
+@app.get(
+    "/streams/{stream_id}/events",
+    response_model=SnapshotPageOut,
+    status_code=200,
+    tags=["snapshots"],
+    summary="Export the applied event history as a paginated, immutable snapshot",
+)
+def export_events(
+    stream_id: str,
+    limit: int = Query(
+        snapshots.DEFAULT_LIMIT,
+        ge=1,
+        le=snapshots.MAX_LIMIT,
+        description="Maximum number of events per page (1..1000)",
+    ),
+    cursor: str | None = Query(
+        None,
+        description=(
+            "Opaque next_cursor from the previous page. Omit it to start a new "
+            "snapshot; once started, every follow-up page must continue it."
+        ),
+    ),
+) -> SnapshotPageOut:
+    try:
+        page = snapshots.export_page(stream_id, limit, cursor)
+    except snapshots.CursorError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    if page is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+    return SnapshotPageOut(**page.as_dict())
 
 
 @app.get(

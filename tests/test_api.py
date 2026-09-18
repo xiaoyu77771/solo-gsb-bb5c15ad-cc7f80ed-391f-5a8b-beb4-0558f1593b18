@@ -1421,3 +1421,366 @@ def test_concurrent_seal_retries_commit_exactly_once(client):
     assert sorted(statuses) == [200] * 19 + [201]
     # The stream stayed sealed and never accepted another event.
     assert client.get("/streams/z-conc").json()["next_sequence"] == 3
+
+# --------------------------------------------------------------------------- #
+# Event-history snapshot export
+# --------------------------------------------------------------------------- #
+
+
+def _snapshot_pages(client, stream_id, limit, cursor=None):
+    url = f"/streams/{stream_id}/events?limit={limit}"
+    if cursor is not None:
+        url += f"&cursor={cursor}"
+    return client.get(url)
+
+
+def _collect_snapshot(client, stream_id, limit):
+    """Follow every next_cursor and return (events, first_page_body)."""
+    collected = []
+    cursor = None
+    first_body = None
+    while True:
+        r = _snapshot_pages(client, stream_id, limit, cursor)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        if first_body is None:
+            first_body = body
+        collected.extend(body["events"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    return collected, first_body
+
+
+def test_snapshot_first_request_pins_current_version_and_balance(client):
+    _seed_deltas(client, "h-pin", (100, -30, 20))  # balance 90, next_sequence 3
+
+    r = _snapshot_pages(client, "h-pin", 2)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["stream_id"] == "h-pin"
+    assert body["snapshot_next_sequence"] == 3
+    assert body["balance"] == 90  # balance at the pinned version
+    assert body["from_sequence"] == 0
+    assert [e["sequence"] for e in body["events"]] == [0, 1]
+    assert body["next_cursor"]
+
+    # Walk the rest; every page reports the same snapshot bound and balance.
+    page2 = _snapshot_pages(client, "h-pin", 2, body["next_cursor"]).json()
+    assert page2["snapshot_next_sequence"] == 3
+    assert page2["balance"] == 90
+    assert page2["from_sequence"] == 2
+    assert [e["sequence"] for e in page2["events"]] == [2]
+    assert page2["next_cursor"] is None
+
+
+def test_snapshot_pagination_covers_every_event_once_in_order(client):
+    _seed_deltas(client, "h-pages", list(range(1, 8)))  # 7 events, balance 28
+    events, first = _collect_snapshot(client, "h-pages", 3)
+    assert [e["sequence"] for e in events] == list(range(7))
+    assert [e["delta"] for e in events] == list(range(1, 8))
+    assert first["snapshot_next_sequence"] == 7
+    assert first["balance"] == 28
+    # No duplicates, no gaps.
+    assert len({e["event_id"] for e in events}) == 7
+
+
+def test_snapshot_concurrent_appends_never_mix_into_open_snapshot(client):
+    _seed_deltas(client, "h-race", [1] * 5)  # next_sequence 5
+
+    first = _snapshot_pages(client, "h-race", 2).json()
+    assert first["snapshot_next_sequence"] == 5
+
+    # Events (and a catch-up chain) land while the client is mid-walk.
+    _post(client, "h-race", "late-7", 7, 40)   # buffered behind gap at 5
+    _post(client, "h-race", "late-5", 5, 7)    # catch-up 5; 6 still missing
+    _post(client, "h-race", "late-6", 6, 8)    # catch-up 6,7 -> next_sequence 8
+
+    page2 = _snapshot_pages(client, "h-race", 2, first["next_cursor"]).json()
+    page3 = _snapshot_pages(client, "h-race", 2, page2["next_cursor"]).json()
+    assert page2["snapshot_next_sequence"] == page3["snapshot_next_sequence"] == 5
+    assert page2["balance"] == page3["balance"] == 5
+    assert [e["sequence"] for e in page2["events"]] == [2, 3]
+    assert [e["sequence"] for e in page3["events"]] == [4]
+    assert page3["next_cursor"] is None
+
+    # A fresh snapshot (no cursor) sees the new current version and balance.
+    fresh = _snapshot_pages(client, "h-race", 100).json()
+    assert fresh["snapshot_next_sequence"] == 8
+    assert fresh["balance"] == 5 + 7 + 8 + 40
+    assert [e["sequence"] for e in fresh["events"]] == list(range(8))
+    assert fresh["next_cursor"] is None
+
+
+def test_snapshot_excludes_buffered_pending_events(client):
+    _post(client, "h-pend", "e1", 1, 200)
+    _post(client, "h-pend", "e2", 2, 50)
+    # Nothing applied yet: the snapshot is the empty prefix [0, 0).
+    body = _snapshot_pages(client, "h-pend", 10).json()
+    assert body["snapshot_next_sequence"] == 0
+    assert body["balance"] == 0
+    assert body["events"] == []
+    assert body["next_cursor"] is None
+
+    _post(client, "h-pend", "e0", 0, 100)  # catch-up -> 3
+    body = _snapshot_pages(client, "h-pend", 10).json()
+    assert body["snapshot_next_sequence"] == 3
+    assert body["balance"] == 350
+    assert [e["sequence"] for e in body["events"]] == [0, 1, 2]
+
+
+def test_snapshot_limit_larger_than_prefix_ends_immediately(client):
+    _seed_deltas(client, "h-small", (1, 2))
+    body = _snapshot_pages(client, "h-small", 100).json()
+    assert [e["sequence"] for e in body["events"]] == [0, 1]
+    assert body["next_cursor"] is None
+    assert body["from_sequence"] == 0
+
+
+def test_snapshot_empty_stream_returns_empty_page(client):
+    _post(client, "h-empty-src", "e0", 0, 1)
+    _fork(client, "h-empty-src", "f", "h-empty", 0)
+    body = _snapshot_pages(client, "h-empty", 50).json()
+    assert body == {
+        "stream_id": "h-empty",
+        "snapshot_next_sequence": 0,
+        "balance": 0,
+        "from_sequence": 0,
+        "events": [],
+        "next_cursor": None,
+    }
+
+
+def test_snapshot_default_limit_applies_when_omitted(client):
+    from app import snapshots
+
+    _seed_deltas(client, "h-default", [1] * (snapshots.DEFAULT_LIMIT + 5))
+    body = client.get("/streams/h-default/events").json()
+    assert len(body["events"]) == snapshots.DEFAULT_LIMIT
+    assert body["next_cursor"] is not None
+
+
+def test_snapshot_unknown_stream_returns_404(client):
+    r = _snapshot_pages(client, "h-ghost", 10)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+    # Even a well-formed cursor for a stream that has vanished yields 404.
+    _seed_deltas(client, "h-exists", (1,))
+    cursor = _snapshot_pages(client, "h-exists", 1).json()["next_cursor"]
+    r = client.get(f"/streams/h-ghost/events?limit=1&cursor={cursor}")
+    assert r.status_code == 400  # cursor is bound to h-exists, mismatch wins
+
+
+def test_snapshot_limit_validation_returns_422(client):
+    _seed_deltas(client, "h-limit", (1,))
+    assert client.get("/streams/h-limit/events?limit=0").status_code == 422
+    assert client.get("/streams/h-limit/events?limit=-1").status_code == 422
+    assert client.get("/streams/h-limit/events?limit=1001").status_code == 422
+    assert client.get("/streams/h-limit/events?limit=true").status_code == 422
+    assert client.get("/streams/h-limit/events?limit=abc").status_code == 422
+
+
+def test_snapshot_garbage_cursor_returns_400(client):
+    _seed_deltas(client, "h-bad", (1,))
+    for bad in ("garbage", "abc.def.ghi", ".", "abc.", ".sig", "!!!.!!!", " ") :
+        r = client.get(f"/streams/h-bad/events?limit=1&cursor={bad}")
+        assert r.status_code == 400, (bad, r.status_code)
+        assert r.json()["detail"]["code"] in ("invalid_cursor", "invalid_cursor_signature")
+
+
+def test_snapshot_bad_signature_returns_400(client):
+    from app import snapshots
+
+    token = snapshots.encode_cursor("h-sig", 5, 0)
+    # Flip a character in the signature segment.
+    payload, _, signature = token.partition(".")
+    flipped_char = "A" if signature[0] != "A" else "B"  # guaranteed different URL-safe char
+    forged = f"{payload}.{flipped_char + signature[1:]}"
+    r = client.get(f"/streams/h-sig/events?limit=1&cursor={forged}")
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "invalid_cursor_signature"
+
+
+def test_snapshot_cursor_signed_with_other_secret_returns_400(client, monkeypatch):
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    from app import config
+
+    _seed_deltas(client, "h-secret", (1, 2))
+    payload = {"next_sequence": 0, "snapshot_next_sequence": 2, "stream_id": "h-secret"}
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    sig = hmac.new(b"a-totally-different-secret", body, hashlib.sha256).digest()
+    token = (
+        base64.urlsafe_b64encode(body).rstrip(b"=").decode()
+        + "."
+        + base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+    )
+    r = client.get(f"/streams/h-secret/events?limit=1&cursor={token}")
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "invalid_cursor_signature"
+    # Sanity: the module reads the configured secret from the environment.
+    monkeypatch.setenv("SNAPSHOT_CURSOR_SECRET", "another")
+    assert config.snapshot_cursor_secret() == b"another"
+
+
+def test_snapshot_tampered_payload_returns_400(client):
+    import base64
+    import json
+
+    from app import snapshots
+
+    _seed_deltas(client, "h-tamper", (1, 2, 3))
+    token = snapshots.encode_cursor("h-tamper", 3, 1)
+    body_b64, _, sig = token.partition(".")
+    body = json.loads(base64.urlsafe_b64decode(body_b64 + "=="))
+
+    # Change the upper bound (would pull newly appended events): signature breaks.
+    tampered = dict(body)
+    tampered["snapshot_next_sequence"] = 999
+    token2 = (
+        base64.urlsafe_b64encode(
+            json.dumps(tampered, separators=(",", ":"), sort_keys=True).encode()
+        ).rstrip(b"=").decode()
+        + "."
+        + sig
+    )
+    r = client.get(f"/streams/h-tamper/events?limit=1&cursor={token2}")
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "invalid_cursor_signature"
+
+    # Skip ahead (would create a gap / leak event): same rejection.
+    tampered = dict(body)
+    tampered["next_sequence"] = 2
+    token3 = (
+        base64.urlsafe_b64encode(
+            json.dumps(tampered, separators=(",", ":"), sort_keys=True).encode()
+        ).rstrip(b"=").decode()
+        + "."
+        + sig
+    )
+    r = client.get(f"/streams/h-tamper/events?limit=1&cursor={token3}")
+    assert r.status_code == 400
+
+
+def test_snapshot_cross_stream_cursor_returns_400(client):
+    _seed_deltas(client, "h-a", (1, 2, 3))
+    _seed_deltas(client, "h-b", (1, 2, 3))
+    cursor = _snapshot_pages(client, "h-a", 1).json()["next_cursor"]
+    r = client.get(f"/streams/h-b/events?limit=1&cursor={cursor}")
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "cursor_stream_mismatch"
+
+
+def test_snapshot_cursor_with_extra_or_illegal_fields_returns_400(client):
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    from app import snapshots
+
+    def sign(body_obj):
+        body = json.dumps(body_obj, separators=(",", ":"), sort_keys=True).encode()
+        sig = hmac.new(snapshots.config.snapshot_cursor_secret(), body, hashlib.sha256).digest()
+        return (
+            base64.urlsafe_b64encode(body).rstrip(b"=").decode()
+            + "."
+            + base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+        )
+
+    _seed_deltas(client, "h-fields", (1,))
+    base_obj = {"next_sequence": 0, "snapshot_next_sequence": 1, "stream_id": "h-fields"}
+
+    cases = [
+        dict(base_obj, extra=1),                               # unknown key
+        {k: v for k, v in base_obj.items() if k != "next_sequence"},  # missing key
+        dict(base_obj, next_sequence=-1),                      # negative
+        dict(base_obj, next_sequence=2),                       # beyond upper bound
+        dict(base_obj, snapshot_next_sequence=-1),
+        dict(base_obj, stream_id=""),                          # empty stream id
+        dict(base_obj, stream_id=5),                           # wrong type
+        dict(base_obj, next_sequence=True),                    # bool, not int
+        dict(base_obj, snapshot_next_sequence="1"),            # string, not int
+    ]
+    for obj in cases:
+        r = client.get(f"/streams/h-fields/events?limit=1&cursor={sign(obj)}")
+        assert r.status_code == 400, (obj, r.status_code, r.text)
+        assert r.json()["detail"]["code"] == "invalid_cursor", obj
+
+
+def test_snapshot_resuming_end_cursor_beyond_new_events_stays_on_snapshot(client):
+    # Cursor at the bound returns an empty final page forever; even after new
+    # events land, the pinned snapshot cannot grow.
+    _seed_deltas(client, "h-end", (1, 2))
+    body = _snapshot_pages(client, "h-end", 10).json()
+    assert body["next_cursor"] is None
+
+    from app import snapshots
+
+    token = snapshots.encode_cursor("h-end", 2, 2)
+    r = _snapshot_pages(client, "h-end", 10, token)
+    assert r.status_code == 200
+    page = r.json()
+    assert page["events"] == []
+    assert page["snapshot_next_sequence"] == 2
+    assert page["balance"] == 3
+    assert page["next_cursor"] is None
+
+    _post(client, "h-end", "e2", 2, 10)
+    r = _snapshot_pages(client, "h-end", 10, token)
+    page = r.json()
+    assert page["snapshot_next_sequence"] == 2
+    assert page["balance"] == 3
+    assert page["events"] == []
+    assert page["next_cursor"] is None
+
+
+def test_snapshot_unicode_stream_id_round_trips(client):
+    stream_id = "账户-α"
+    _post(client, stream_id, "e0", 0, 11)
+    body = _snapshot_pages(client, stream_id, 1).json()
+    assert body["stream_id"] == stream_id
+    assert body["events"][0]["event_id"] == "e0"
+    assert body["next_cursor"] is None
+
+
+def test_concurrent_walk_and_appends_keep_snapshot_consistent(client):
+    import threading
+
+    _seed_deltas(client, "h-cwalk", [1] * 20)
+    pages: list[dict] = []
+    cursor_holder = {"cursor": None}
+
+    def walk():
+        local_cursor = None
+        while True:
+            r = _snapshot_pages(client, "h-cwalk", 4, local_cursor)
+            if r.status_code != 200:
+                pages.append({"error": r.status_code})
+                return
+            body = r.json()
+            pages.append(body)
+            local_cursor = body["next_cursor"]
+            if local_cursor is None:
+                return
+
+    def append():
+        for seq in range(20, 40):
+            _post(client, "h-cwalk", f"late-{seq}", seq, 1)
+
+    t1 = threading.Thread(target=walk)
+    t2 = threading.Thread(target=append)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    seen = [e for p in pages for e in p["events"]]
+    assert all("error" not in p for p in pages)
+    assert [e["sequence"] for e in seen] == list(range(len(seen)))
+    assert len(seen) <= 20
+    assert all(p["snapshot_next_sequence"] == pages[0]["snapshot_next_sequence"] for p in pages)
+    assert all(p["balance"] == pages[0]["balance"] for p in pages)

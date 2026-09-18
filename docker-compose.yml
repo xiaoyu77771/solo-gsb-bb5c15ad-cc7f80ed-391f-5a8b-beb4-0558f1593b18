@@ -8,6 +8,9 @@ services:
     environment:
       APP_PORT: "8000"
       DATABASE_PATH: /data/events.db
+      # HMAC key signing snapshot export cursors. Override this default for any
+      # real deployment: changing it invalidates previously issued cursors.
+      SNAPSHOT_CURSOR_SECRET: "${SNAPSHOT_CURSOR_SECRET:-dev-only-snapshot-cursor-secret-change-me}"
     volumes:
       - events-data:/data
     restart: unless-stopped
